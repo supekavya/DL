@@ -3,6 +3,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import warnings
@@ -87,6 +90,51 @@ def create_sequences(data, seq_length):
     return np.array(X), np.array(y)
 
 
+# ── PyTorch Models ────────────────────────────────────────────────────────────
+class RNNModel(nn.Module):
+    def __init__(
+        self, rnn_type, input_size=1, hidden_size=64, num_layers=1, dropout=0.2
+    ):
+        super(RNNModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        if rnn_type == "LSTM":
+            self.rnn = nn.LSTM(
+                input_size,
+                hidden_size,
+                num_layers,
+                batch_first=True,
+                dropout=dropout if num_layers > 1 else 0,
+            )
+        elif rnn_type == "GRU":
+            self.rnn = nn.GRU(
+                input_size,
+                hidden_size,
+                num_layers,
+                batch_first=True,
+                dropout=dropout if num_layers > 1 else 0,
+            )
+        else:
+            self.rnn = nn.RNN(
+                input_size,
+                hidden_size,
+                num_layers,
+                batch_first=True,
+                nonlinearity="tanh",
+            )
+
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        out = out[:, -1, :]  # Take the last time step
+        out = self.dropout(out)
+        out = self.fc(out)
+        return out
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🔄 RNN Explorer")
@@ -143,7 +191,7 @@ if page == "📊 EDA":
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "🏗️ Build & Train":
     st.markdown('<span class="badge">Build & Train RNN</span>', unsafe_allow_html=True)
-    st.title("Build & Train Recurrent Neural Network")
+    st.title("Build & Train Recurrent Neural Network (PyTorch)")
     st.markdown(
         '<div class="theory-box">Configure the RNN architecture. The model will learn to predict the next value in the sequence based on a sliding window of past values.</div>',
         unsafe_allow_html=True,
@@ -169,11 +217,6 @@ elif page == "🏗️ Build & Train":
     with c2:
         if run_btn:
             try:
-                import tensorflow as tf
-                from tensorflow import keras
-                from tensorflow.keras import layers
-                from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-
                 values = df["value"].values.reshape(-1, 1)
                 scaler = MinMaxScaler(feature_range=(0, 1))
                 scaled_values = scaler.fit_transform(values)
@@ -185,68 +228,105 @@ elif page == "🏗️ Build & Train":
                 X_train, y_train = create_sequences(train_data, seq_length)
                 X_test, y_test = create_sequences(test_data, seq_length)
 
-                X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
-                X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+                X_train = np.reshape(
+                    X_train, (X_train.shape[0], X_train.shape[1], 1)
+                ).astype(np.float32)
+                X_test = np.reshape(
+                    X_test, (X_test.shape[0], X_test.shape[1], 1)
+                ).astype(np.float32)
+                y_train = y_train.astype(np.float32)
+                y_test = y_test.astype(np.float32)
 
-                model = keras.Sequential()
-                if rnn_type == "LSTM":
-                    model.add(
-                        layers.LSTM(
-                            units, return_sequences=False, input_shape=(seq_length, 1)
-                        )
-                    )
-                elif rnn_type == "GRU":
-                    model.add(
-                        layers.GRU(
-                            units, return_sequences=False, input_shape=(seq_length, 1)
-                        )
-                    )
-                else:
-                    model.add(
-                        layers.SimpleRNN(
-                            units, return_sequences=False, input_shape=(seq_length, 1)
-                        )
-                    )
-
-                model.add(layers.Dropout(dropout))
-                model.add(layers.Dense(1))
-
-                model.compile(
-                    optimizer=keras.optimizers.Adam(learning_rate=lr), loss="mse"
+                train_dataset = TensorDataset(
+                    torch.tensor(X_train), torch.tensor(y_train).unsqueeze(1)
+                )
+                test_dataset = TensorDataset(
+                    torch.tensor(X_test), torch.tensor(y_test).unsqueeze(1)
                 )
 
-                cbs = [
-                    EarlyStopping(
-                        monitor="val_loss", patience=15, restore_best_weights=True
-                    ),
-                    ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=7),
-                ]
+                train_loader = DataLoader(
+                    train_dataset, batch_size=batch_sz, shuffle=True
+                )
+                test_loader = DataLoader(
+                    test_dataset, batch_size=batch_sz, shuffle=False
+                )
 
-                with st.spinner("Training…"):
-                    hist = model.fit(
-                        X_train,
-                        y_train,
-                        validation_split=0.15,
-                        epochs=epochs,
-                        batch_size=batch_sz,
-                        callbacks=cbs,
-                        verbose=0,
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model = RNNModel(
+                    rnn_type=rnn_type,
+                    input_size=1,
+                    hidden_size=units,
+                    num_layers=1,
+                    dropout=dropout,
+                ).to(device)
+
+                criterion = nn.MSELoss()
+                optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+                train_losses, val_losses = [], []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                for epoch in range(epochs):
+                    model.train()
+                    epoch_loss = 0
+                    for bx, by in train_loader:
+                        bx, by = bx.to(device), by.to(device)
+                        optimizer.zero_grad()
+                        outputs = model(bx)
+                        loss = criterion(outputs, by)
+                        loss.backward()
+                        optimizer.step()
+                        epoch_loss += loss.item() * bx.size(0)
+
+                    train_losses.append(epoch_loss / len(train_dataset))
+
+                    # Validation
+                    model.eval()
+                    val_loss, val_total = 0, 0
+                    with torch.no_grad():
+                        for bx, by in test_loader:
+                            bx, by = bx.to(device), by.to(device)
+                            outputs = model(bx)
+                            loss = criterion(outputs, by)
+                            val_loss += loss.item() * bx.size(0)
+                            val_total += bx.size(0)
+
+                    val_losses.append(val_loss / val_total)
+                    progress_bar.progress((epoch + 1) / epochs)
+                    status_text.text(
+                        f"Epoch {epoch + 1}/{epochs} | Val Loss: {val_losses[-1]:.4f}"
                     )
 
-                y_pred = model.predict(X_test, verbose=0)
-                y_pred_inv = scaler.inverse_transform(y_pred)
-                y_test_inv = scaler.inverse_transform(y_test)
+                progress_bar.empty()
+                status_text.empty()
+
+                # Final Evaluation
+                model.eval()
+                all_preds, all_targets = [], []
+                with torch.no_grad():
+                    for bx, by in test_loader:
+                        bx = bx.to(device)
+                        outputs = model(bx)
+                        all_preds.extend(outputs.cpu().numpy().flatten())
+                        all_targets.extend(by.numpy().flatten())
+
+                y_pred_inv = scaler.inverse_transform(
+                    np.array(all_preds).reshape(-1, 1)
+                )
+                y_test_inv = scaler.inverse_transform(
+                    np.array(all_targets).reshape(-1, 1)
+                )
 
                 mse = mean_squared_error(y_test_inv, y_pred_inv)
                 mae = mean_absolute_error(y_test_inv, y_pred_inv)
-                tloss = float(hist.history["val_loss"][-1])
-                params = model.count_params()
+                tloss = val_losses[-1]
+                params = sum(p.numel() for p in model.parameters())
                 mchips(mse, mae, tloss, params)
 
-                hdf = pd.DataFrame(hist.history)
                 fig, ax = dfig(12, 4)
-                ax.plot(hdf["loss"], color="#f87171", lw=2, label="Train")
-                ax.plot(hdf["val_loss"], color="#60a5fa", lw=2, label="Val")
+                ax.plot(train_losses, color="#f87171", lw=2, label="Train")
+                ax.plot(val_losses, color="#60a5fa", lw=2, label="Val")
                 ax.set_title("Training Loss (MSE)")
                 ax.set_xlabel("Epoch")
                 ax.set_ylabel("Loss")
@@ -276,14 +356,20 @@ elif page == "🏗️ Build & Train":
                 st.pyplot(fig)
                 plt.close()
 
-            except ImportError:
-                st.error("TensorFlow not installed. Run: `pip install tensorflow`")
+                st.session_state["rnn_model"] = model.cpu()
+                st.session_state["rnn_scaler"] = scaler
+                st.session_state["rnn_seq_len"] = seq_length
+                st.session_state["rnn_type"] = rnn_type
+                st.success("Model trained and saved to session!")
+
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
         else:
             st.info("👈 Configure the network on the left and click **Train Model**.")
             st.markdown("**Planned Architecture:**")
             arch_lines = ["```", f"Input  (Sequence Length: {seq_length}, Features: 1)"]
             arch_lines += [f"  {rnn_type}({units}) → Dropout({dropout})"]
-            arch_lines += ["  Dense(1)", "Output (Next Value Prediction)", "```"]
+            arch_lines += ["  Linear(1)", "Output (Next Value Prediction)", "```"]
             st.markdown("\n".join(arch_lines))
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -298,64 +384,78 @@ elif page == "🔮 Predict":
     )
 
     try:
-        import tensorflow as tf
-        from tensorflow import keras
-        from tensorflow.keras import layers
-        from tensorflow.keras.callbacks import EarlyStopping
+        if "rnn_model" not in st.session_state:
+            with st.spinner("Training default model for prediction..."):
+                values = df["value"].values.reshape(-1, 1)
+                scaler = MinMaxScaler(feature_range=(0, 1))
+                scaled_values = scaler.fit_transform(values)
+                seq_len = 20
+                X, y = create_sequences(scaled_values, seq_len)
+                X = np.reshape(X, (X.shape[0], X.shape[1], 1)).astype(np.float32)
+                y = y.astype(np.float32)
 
-        @st.cache_resource
-        def quick_model():
-            values = df["value"].values.reshape(-1, 1)
-            scaler = MinMaxScaler(feature_range=(0, 1))
-            scaled_values = scaler.fit_transform(values)
-            seq_len = 20
-            X, y = create_sequences(scaled_values, seq_len)
-            X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+                train_dataset = TensorDataset(
+                    torch.tensor(X), torch.tensor(y).unsqueeze(1)
+                )
+                train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
-            model = keras.Sequential(
-                [
-                    layers.LSTM(64, input_shape=(seq_len, 1)),
-                    layers.Dropout(0.2),
-                    layers.Dense(1),
-                ]
-            )
-            model.compile(optimizer="adam", loss="mse")
-            model.fit(
-                X,
-                y,
-                epochs=80,
-                batch_size=32,
-                verbose=0,
-                callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
-                validation_split=0.15,
-            )
-            return model, scaler, seq_len, scaled_values
+                model = RNNModel(
+                    rnn_type="LSTM",
+                    input_size=1,
+                    hidden_size=64,
+                    num_layers=1,
+                    dropout=0.2,
+                )
+                criterion = nn.MSELoss()
+                optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-        with st.spinner("Preparing model…"):
-            model, scaler, seq_len, scaled_values = quick_model()
+                for epoch in range(60):
+                    model.train()
+                    for bx, by in train_loader:
+                        optimizer.zero_grad()
+                        outputs = model(bx)
+                        loss = criterion(outputs, by)
+                        loss.backward()
+                        optimizer.step()
+
+                st.session_state["rnn_model"] = model
+                st.session_state["rnn_scaler"] = scaler
+                st.session_state["rnn_seq_len"] = seq_len
+
+        model = st.session_state["rnn_model"]
+        scaler = st.session_state["rnn_scaler"]
+        seq_len = st.session_state["rnn_seq_len"]
 
         forecast_steps = st.slider("Forecast Steps", 10, 100, 50)
 
         if st.button("🔄 Generate Forecast", use_container_width=True):
-            last_seq = scaled_values[-seq_len:].reshape(1, seq_len, 1)
+            last_seq = (
+                scaler.transform(df["value"].values.reshape(-1, 1))[-seq_len:]
+                .reshape(1, seq_len, 1)
+                .astype(np.float32)
+            )
             forecast_scaled = []
 
-            for _ in range(forecast_steps):
-                pred = model.predict(last_seq, verbose=0)
-                forecast_scaled.append(pred[0, 0])
-                last_seq = np.append(
-                    last_seq[:, 1:, :], np.reshape(pred, (1, 1, 1)), axis=1
-                )
+            model.eval()
+            with torch.no_grad():
+                current_seq = torch.tensor(last_seq)
+                for _ in range(forecast_steps):
+                    pred = model(current_seq).item()
+                    forecast_scaled.append(pred)
+                    # Shift sequence and add new prediction
+                    next_seq = torch.cat(
+                        (current_seq[:, 1:, :], torch.tensor([[[pred]]])), dim=1
+                    )
+                    current_seq = next_seq
 
             forecast_inv = scaler.inverse_transform(
                 np.array(forecast_scaled).reshape(-1, 1)
             )
-            last_actual_inv = scaler.inverse_transform(scaled_values[-seq_len:])
+            last_actual_inv = scaler.inverse_transform(last_seq.reshape(-1, 1))
 
             fig, ax = dfig(14, 5)
             hist_steps = len(last_actual_inv)
 
-# Plot historical data
             ax.plot(
                 np.arange(hist_steps),
                 last_actual_inv.flatten(),
@@ -364,8 +464,9 @@ elif page == "🔮 Predict":
                 label="Historical",
             )
 
-            # Plot forecast data (connects smoothly from the last historical point)
-            forecast_y = np.concatenate(([last_actual_inv[-1, 0]], forecast_inv.flatten()))
+            forecast_y = np.concatenate(
+                ([last_actual_inv[-1, 0]], forecast_inv.flatten())
+            )
             forecast_x = np.arange(hist_steps - 1, hist_steps - 1 + forecast_steps + 1)
 
             ax.plot(
@@ -391,8 +492,8 @@ elif page == "🔮 Predict":
             st.pyplot(fig)
             plt.close()
 
-    except ImportError:
-        st.error("TensorFlow required. Install with: `pip install tensorflow`")
+    except Exception as e:
+        st.error(f"An error occurred: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ARCHITECTURE STUDY
@@ -508,6 +609,6 @@ elif page == "📐 Architecture Study":
 
 st.markdown("---")
 st.markdown(
-    "<center style='color:#4a5568;font-size:.78rem'>Recurrent Neural Network (RNN) Explorer &nbsp;|&nbsp; TensorFlow · Keras · Scikit-learn</center>",
+    "<center style='color:#4a5568;font-size:.78rem'>Recurrent Neural Network (RNN) Explorer &nbsp;|&nbsp; PyTorch · Scikit-learn</center>",
     unsafe_allow_html=True,
 )
