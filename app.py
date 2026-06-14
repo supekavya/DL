@@ -3,13 +3,16 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     accuracy_score,
-    classification_report,
+    precision_score,
+    recall_score,
+    f1_score,
     confusion_matrix,
-    roc_curve,
-    auc,
 )
 import warnings
 
@@ -90,10 +93,36 @@ def create_sequences_with_labels(data, seq_length):
     for i in range(len(data) - seq_length):
         window = data[i : i + seq_length]
         X.append(window)
-        # Label: 1 if the end of the window is higher than the start (Upward trend), else 0
         label = 1 if window[-1] > window[0] else 0
         y.append(label)
     return np.array(X), np.array(y)
+
+
+# ── PyTorch Model ─────────────────────────────────────────────────────────────
+class BiLSTMClassifier(nn.Module):
+    def __init__(self, input_size=1, hidden_size=32, num_layers=1, dropout=0.2):
+        super(BiLSTMClassifier, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bilstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size * 2, 1)  # *2 because bidirectional
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        out, _ = self.bilstm(x)
+        out = out[:, -1, :]  # Take the last time step
+        out = self.dropout(out)
+        out = self.fc(out)
+        out = self.sigmoid(out)
+        return out
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -157,9 +186,9 @@ elif page == "🏗️ Build & Train":
     st.markdown(
         '<span class="badge">Build & Train BiLSTM</span>', unsafe_allow_html=True
     )
-    st.title("Build & Train Bidirectional LSTM")
+    st.title("Build & Train Bidirectional LSTM (PyTorch)")
     st.markdown(
-        '<div class="theory-box">Configure the BiLSTM architecture. By processing the sequence in both forward and backward directions, the model can learn patterns that depend on the entire context of the window, not just the past.</div>',
+        '<div class="theory-box">Configure the BiLSTM architecture. By processing the sequence in both forward and backward directions, the model can learn patterns that depend on the entire context of the window.</div>',
         unsafe_allow_html=True,
     )
 
@@ -167,109 +196,138 @@ elif page == "🏗️ Build & Train":
     with c1:
         st.markdown("**Architecture**")
         seq_length = st.slider("Sequence Length (Time Steps)", 10, 100, 30)
-        units = st.select_slider(
-            "BiLSTM Units (per direction)", options=[16, 32, 64, 128], value=32
+        hidden_size = st.select_slider(
+            "Hidden Size (per direction)", options=[16, 32, 64, 128], value=32
         )
-        layers_count = st.slider("Number of BiLSTM Layers", 1, 3, 1)
+        num_layers = st.slider("Number of BiLSTM Layers", 1, 3, 1)
         dropout = st.slider("Dropout Rate", 0.0, 0.5, 0.2, 0.05)
         st.markdown("**Training**")
         lr = st.select_slider(
             "Learning Rate", options=[0.0001, 0.0005, 0.001, 0.005], value=0.001
         )
         batch_sz = st.select_slider("Batch Size", options=[16, 32, 64, 128], value=32)
-        epochs = st.slider("Max Epochs", 20, 200, 100)
+        epochs = st.slider("Max Epochs", 10, 100, 50)
         run_btn = st.button("🚀 Train Model", use_container_width=True)
 
     with c2:
         if run_btn:
             try:
-                import tensorflow as tf
-                from tensorflow import keras
-                from tensorflow.keras import layers
-                from tensorflow.keras.callbacks import EarlyStopping
-
                 values = df["value"].values.reshape(-1, 1)
                 scaler = StandardScaler()
                 scaled_values = scaler.fit_transform(values)
 
                 X, y = create_sequences_with_labels(scaled_values.flatten(), seq_length)
-                X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+                X = np.reshape(X, (X.shape[0], X.shape[1], 1)).astype(np.float32)
+                y = y.astype(np.float32)
 
-                # Train/test split
                 split_idx = int(len(X) * 0.8)
                 X_train, X_test = X[:split_idx], X[split_idx:]
                 y_train, y_test = y[:split_idx], y[split_idx:]
 
-                model = keras.Sequential()
-                for i in range(layers_count):
-                    return_seq = True if i < layers_count - 1 else False
-                    # Bidirectional wrapper doubles the units internally, but we specify units per direction
-                    model.add(
-                        layers.Bidirectional(
-                            layers.LSTM(units, return_sequences=return_seq),
-                            input_shape=(seq_length, 1) if i == 0 else None,
-                        )
-                    )
-                    if i < layers_count - 1:
-                        model.add(layers.Dropout(dropout))
-
-                model.add(layers.Dropout(dropout))
-                model.add(layers.Dense(1, activation="sigmoid"))
-
-                model.compile(
-                    optimizer=keras.optimizers.Adam(learning_rate=lr),
-                    loss="binary_crossentropy",
-                    metrics=["accuracy"],
+                train_dataset = TensorDataset(
+                    torch.tensor(X_train), torch.tensor(y_train).unsqueeze(1)
+                )
+                test_dataset = TensorDataset(
+                    torch.tensor(X_test), torch.tensor(y_test).unsqueeze(1)
                 )
 
-                cbs = [
-                    EarlyStopping(
-                        monitor="val_accuracy",
-                        patience=15,
-                        restore_best_weights=True,
-                        mode="max",
+                train_loader = DataLoader(
+                    train_dataset, batch_size=batch_sz, shuffle=True
+                )
+                test_loader = DataLoader(
+                    test_dataset, batch_size=batch_sz, shuffle=False
+                )
+
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model = BiLSTMClassifier(
+                    input_size=1,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    dropout=dropout,
+                ).to(device)
+
+                criterion = nn.BCELoss()
+                optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+                train_losses, val_losses, train_accs, val_accs = [], [], [], []
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                for epoch in range(epochs):
+                    model.train()
+                    epoch_loss, epoch_correct, epoch_total = 0, 0, 0
+                    for bx, by in train_loader:
+                        bx, by = bx.to(device), by.to(device)
+                        optimizer.zero_grad()
+                        outputs = model(bx)
+                        loss = criterion(outputs, by)
+                        loss.backward()
+                        optimizer.step()
+
+                        epoch_loss += loss.item() * bx.size(0)
+                        preds = (outputs >= 0.5).float()
+                        epoch_correct += (preds == by).sum().item()
+                        epoch_total += bx.size(0)
+
+                    train_losses.append(epoch_loss / epoch_total)
+                    train_accs.append(epoch_correct / epoch_total)
+
+                    # Validation
+                    model.eval()
+                    val_loss, val_correct, val_total = 0, 0, 0
+                    with torch.no_grad():
+                        for bx, by in test_loader:
+                            bx, by = bx.to(device), by.to(device)
+                            outputs = model(bx)
+                            loss = criterion(outputs, by)
+                            val_loss += loss.item() * bx.size(0)
+                            preds = (outputs >= 0.5).float()
+                            val_correct += (preds == by).sum().item()
+                            val_total += bx.size(0)
+
+                    val_losses.append(val_loss / val_total)
+                    val_accs.append(val_correct / val_total)
+
+                    progress_bar.progress((epoch + 1) / epochs)
+                    status_text.text(
+                        f"Epoch {epoch + 1}/{epochs} | Train Acc: {train_accs[-1]:.3f} | Val Acc: {val_accs[-1]:.3f}"
                     )
-                ]
 
-                with st.spinner("Training…"):
-                    hist = model.fit(
-                        X_train,
-                        y_train,
-                        validation_split=0.15,
-                        epochs=epochs,
-                        batch_size=batch_sz,
-                        callbacks=cbs,
-                        verbose=0,
-                    )
+                progress_bar.empty()
+                status_text.empty()
 
-                y_pred_prob = model.predict(X_test, verbose=0).flatten()
-                y_pred = (y_pred_prob >= 0.5).astype(int)
+                # Final Evaluation
+                model.eval()
+                all_preds, all_targets = [], []
+                with torch.no_grad():
+                    for bx, by in test_loader:
+                        bx = bx.to(device)
+                        outputs = model(bx)
+                        preds = (outputs >= 0.5).float().cpu().numpy()
+                        all_preds.extend(preds.flatten())
+                        all_targets.extend(by.numpy().flatten())
 
-                acc = accuracy_score(y_test, y_pred)
-                params = model.count_params()
-
-                # Calculate precision, recall, f1
-                from sklearn.metrics import precision_score, recall_score, f1_score
-
-                prec = precision_score(y_test, y_pred, zero_division=0)
-                rec = recall_score(y_test, y_pred, zero_division=0)
-                f1 = f1_score(y_test, y_pred, zero_division=0)
+                acc = accuracy_score(all_targets, all_preds)
+                prec = precision_score(all_targets, all_preds, zero_division=0)
+                rec = recall_score(all_targets, all_preds, zero_division=0)
+                f1 = f1_score(all_targets, all_preds, zero_division=0)
 
                 mchips(acc, prec, rec, f1)
 
-                hdf = pd.DataFrame(hist.history)
+                # Plotting
                 fig, axes = dfig(14, 5, 2)
                 axes = np.array(axes).flatten()
 
-                axes[0].plot(hdf["loss"], color="#f87171", lw=2, label="Train")
-                axes[0].plot(hdf["val_loss"], color="#a78bfa", lw=2, label="Val")
-                axes[0].set_title("Training Loss (Binary Crossentropy)")
+                axes[0].plot(train_losses, color="#f87171", lw=2, label="Train")
+                axes[0].plot(val_losses, color="#a78bfa", lw=2, label="Val")
+                axes[0].set_title("Training Loss (BCE)")
                 axes[0].set_xlabel("Epoch")
                 axes[0].set_ylabel("Loss")
                 axes[0].legend(labelcolor="white", facecolor=DARK_AX, edgecolor=GRID)
 
-                axes[1].plot(hdf["accuracy"], color="#34d399", lw=2, label="Train")
-                axes[1].plot(hdf["val_accuracy"], color="#fbbf24", lw=2, label="Val")
+                axes[1].plot(train_accs, color="#34d399", lw=2, label="Train")
+                axes[1].plot(val_accs, color="#fbbf24", lw=2, label="Val")
                 axes[1].set_title("Training Accuracy")
                 axes[1].set_xlabel("Epoch")
                 axes[1].set_ylabel("Accuracy")
@@ -279,60 +337,47 @@ elif page == "🏗️ Build & Train":
                 st.pyplot(fig)
                 plt.close()
 
-                # Confusion Matrix & ROC
-                fig, axes2 = dfig(14, 5, 2)
-                axes2 = np.array(axes2).flatten()
-
-                cm = confusion_matrix(y_test, y_pred)
+                # Confusion Matrix
+                fig, ax = dfig(8, 6)
+                cm = confusion_matrix(all_targets, all_preds)
                 sns.heatmap(
                     cm,
                     annot=True,
                     fmt="d",
                     cmap="Purples",
-                    ax=axes2[0],
+                    ax=ax,
                     xticklabels=["Downward (0)", "Upward (1)"],
                     yticklabels=["Downward (0)", "Upward (1)"],
                     linewidths=1,
                     linecolor="white",
                     annot_kws={"color": "white", "size": 14},
                 )
-                axes2[0].set_title("Confusion Matrix", color="#e2e8f0")
-                axes2[0].set_facecolor(DARK_AX)
-                axes2[0].tick_params(colors=TEXT)
-
-                fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
-                roc_auc = auc(fpr, tpr)
-                axes2[1].plot(
-                    fpr,
-                    tpr,
-                    color="#a78bfa",
-                    lw=2.5,
-                    label=f"BiLSTM (AUC = {roc_auc:.3f})",
-                )
-                axes2[1].fill_between(fpr, tpr, alpha=0.1, color="#a78bfa")
-                axes2[1].plot([0, 1], [0, 1], "w--", lw=1, alpha=0.4)
-                axes2[1].set_title("ROC Curve")
-                axes2[1].set_xlabel("False Positive Rate")
-                axes2[1].set_ylabel("True Positive Rate")
-                axes2[1].legend(labelcolor="white", facecolor=DARK_AX, edgecolor=GRID)
-
+                ax.set_title("Confusion Matrix", color="#e2e8f0")
+                ax.set_facecolor(DARK_AX)
+                ax.tick_params(colors=TEXT)
                 plt.tight_layout()
                 st.pyplot(fig)
                 plt.close()
 
-            except ImportError:
-                st.error("TensorFlow not installed. Run: `pip install tensorflow`")
+                # Save to session state
+                st.session_state["pt_model"] = model.cpu()
+                st.session_state["pt_scaler"] = scaler
+                st.session_state["pt_seq_len"] = seq_length
+                st.success("Model trained and saved to session!")
+
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
         else:
             st.info("👈 Configure the network on the left and click **Train Model**.")
             st.markdown("**Planned Architecture:**")
             arch_lines = ["```", f"Input  (Sequence Length: {seq_length}, Features: 1)"]
-            for i in range(layers_count):
-                arch_lines += [f"  Bidirectional(LSTM({units}), merge_mode='concat')"]
-                if i < layers_count - 1:
-                    arch_lines += [f"  Dropout({dropout})"]
             arch_lines += [
-                f"  Dropout({dropout})",
-                "  Dense(1, activation='sigmoid')",
+                f"  BiLSTM(hidden_size={hidden_size}, num_layers={num_layers}, bidirectional=True)"
+            ]
+            arch_lines += [f"  Dropout({dropout})"]
+            arch_lines += [
+                "  Linear(hidden_size * 2, 1)",
+                "  Sigmoid()",
                 "Output (Probability of Upward Trend)",
                 "```",
             ]
@@ -347,69 +392,68 @@ elif page == "🔮 Classify Sequence":
     )
     st.title("Classify a Time Series Window")
     st.markdown(
-        '<div class="theory-box">Input a custom sequence or use a random window from the dataset. The BiLSTM will analyze the <b>entire</b> window (from start to end and end to start) to determine if the overall trend is Upward or Downward.</div>',
+        '<div class="theory-box">Input a custom sequence or use a random window from the dataset. The BiLSTM will analyze the <b>entire</b> window to determine if the overall trend is Upward or Downward.</div>',
         unsafe_allow_html=True,
     )
 
     try:
-        import tensorflow as tf
-        from tensorflow import keras
-        from tensorflow.keras import layers
-        from tensorflow.keras.callbacks import EarlyStopping
+        if "pt_model" not in st.session_state:
+            with st.spinner("Training default model for prediction..."):
+                values = df["value"].values.reshape(-1, 1)
+                scaler = StandardScaler()
+                scaled_values = scaler.fit_transform(values).flatten()
+                seq_len = 30
 
-        @st.cache_resource
-        def quick_model():
-            values = df["value"].values.reshape(-1, 1)
-            scaler = StandardScaler()
-            scaled_values = scaler.fit_transform(values).flatten()
-            seq_len = 30
+                X, y = create_sequences_with_labels(scaled_values, seq_len)
+                X = np.reshape(X, (X.shape[0], X.shape[1], 1)).astype(np.float32)
+                y = y.astype(np.float32)
 
-            X, y = create_sequences_with_labels(scaled_values, seq_len)
-            X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+                split_idx = int(len(X) * 0.8)
+                X_train, y_train = X[:split_idx], y[:split_idx]
 
-            split_idx = int(len(X) * 0.8)
-            X_train, y_train = X[:split_idx], y[:split_idx]
+                train_dataset = TensorDataset(
+                    torch.tensor(X_train), torch.tensor(y_train).unsqueeze(1)
+                )
+                train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
-            model = keras.Sequential(
-                [
-                    layers.Bidirectional(
-                        layers.LSTM(32, return_sequences=True), input_shape=(seq_len, 1)
-                    ),
-                    layers.Dropout(0.2),
-                    layers.Bidirectional(layers.LSTM(16, return_sequences=False)),
-                    layers.Dropout(0.2),
-                    layers.Dense(1, activation="sigmoid"),
-                ]
-            )
-            model.compile(
-                optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"]
-            )
-            model.fit(
-                X_train,
-                y_train,
-                epochs=60,
-                batch_size=32,
-                verbose=0,
-                callbacks=[
-                    EarlyStopping(patience=10, restore_best_weights=True, mode="max")
-                ],
-                validation_split=0.15,
-            )
-            return model, scaler, seq_len, scaled_values
+                model = BiLSTMClassifier(
+                    input_size=1, hidden_size=32, num_layers=1, dropout=0.2
+                )
+                criterion = nn.BCELoss()
+                optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-        with st.spinner("Preparing model…"):
-            model, scaler, seq_len, scaled_values = quick_model()
+                for epoch in range(40):
+                    model.train()
+                    for bx, by in train_loader:
+                        optimizer.zero_grad()
+                        outputs = model(bx)
+                        loss = criterion(outputs, by)
+                        loss.backward()
+                        optimizer.step()
+
+                st.session_state["pt_model"] = model
+                st.session_state["pt_scaler"] = scaler
+                st.session_state["pt_seq_len"] = seq_len
+
+        model = st.session_state["pt_model"]
+        scaler = st.session_state["pt_scaler"]
+        seq_len = st.session_state["pt_seq_len"]
 
         use_random = st.checkbox("Use random window from dataset", value=True)
 
         if use_random:
-            start_idx = np.random.randint(0, len(scaled_values) - seq_len - 100)
-            window_scaled = scaled_values[start_idx : start_idx + seq_len]
+            start_idx = np.random.randint(
+                0,
+                len(scaler.transform(df["value"].values.reshape(-1, 1)).flatten())
+                - seq_len
+                - 100,
+            )
+            window_scaled = scaler.transform(
+                df["value"].values.reshape(-1, 1)
+            ).flatten()[start_idx : start_idx + seq_len]
             true_label = 1 if window_scaled[-1] > window_scaled[0] else 0
         else:
-            st.markdown(
-                "**Manually define the sequence (first 10 steps shown for brevity, rest are zero)**"
-            )
+            st.markdown("**Manually define the sequence (first 10 steps shown)**")
             cols = st.columns(10)
             manual_vals = []
             for i in range(10):
@@ -421,8 +465,13 @@ elif page == "🔮 Classify Sequence":
             true_label = 1 if window_scaled[-1] > window_scaled[0] else 0
 
         if st.button("🔮 Classify Window", use_container_width=True):
-            X_input = window_scaled.reshape(1, seq_len, 1)
-            prob = float(model.predict(X_input, verbose=0).flatten()[0])
+            X_input = torch.tensor(
+                window_scaled.reshape(1, seq_len, 1), dtype=torch.float32
+            )
+            model.eval()
+            with torch.no_grad():
+                prob = float(model(X_input).item())
+
             pred_class = "Upward Trend (1)" if prob >= 0.5 else "Downward Trend (0)"
             color = "#34d399" if prob >= 0.5 else "#f87171"
 
@@ -436,7 +485,6 @@ elif page == "🔮 Classify Sequence":
                 unsafe_allow_html=True,
             )
 
-            # Visualize the window
             fig, ax = dfig(12, 4)
             ax.plot(
                 np.arange(seq_len),
@@ -450,8 +498,6 @@ elif page == "🔮 Classify Sequence":
             ax.set_title("Input Sequence (Standardized)")
             ax.set_xlabel("Time Step")
             ax.set_ylabel("Value")
-
-            # Add start and end markers
             ax.scatter(
                 0, window_scaled[0], color="#f87171", s=100, zorder=5, label="Start"
             )
@@ -464,13 +510,12 @@ elif page == "🔮 Classify Sequence":
                 label="End",
             )
             ax.legend(labelcolor="white", facecolor=DARK_AX, edgecolor=GRID)
-
             plt.tight_layout()
             st.pyplot(fig)
             plt.close()
 
-    except ImportError:
-        st.error("TensorFlow required. Install with: `pip install tensorflow`")
+    except Exception as e:
+        st.error(f"An error occurred: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ARCHITECTURE STUDY
@@ -484,7 +529,7 @@ elif page == "📐 Architecture Study":
     with tab1:
         st.markdown("**How Bidirectional Processing Works**")
         st.markdown(
-            '<div class="theory-box">A standard LSTM only looks at <b>past</b> context ($x_{t-1}, x_{t-2}, ...$). A <b>Bidirectional LSTM</b> consists of two separate LSTMs: one processes the sequence forward (past to future), and the other processes it backward (future to past). Their hidden states are then concatenated at each time step.</div>',
+            '<div class="theory-box">A standard LSTM only looks at <b>past</b> context. A <b>Bidirectional LSTM</b> consists of two separate LSTMs: one processes the sequence forward, and the other processes it backward. Their hidden states are then concatenated at each time step.</div>',
             unsafe_allow_html=True,
         )
 
@@ -501,7 +546,6 @@ elif page == "📐 Architecture Study":
         steps = 4
         x_pos = np.arange(steps)
 
-        # Forward pass (bottom)
         for i in range(steps):
             ax.plot(
                 [x_pos[i], x_pos[i]],
@@ -528,7 +572,6 @@ elif page == "📐 Architecture Study":
                     arrowprops=dict(arrowstyle="->", color="#34d399", lw=2),
                 )
 
-        # Backward pass (top)
         for i in range(steps - 1, -1, -1):
             ax.plot(
                 [x_pos[i], x_pos[i]],
@@ -554,7 +597,6 @@ elif page == "📐 Architecture Study":
                     arrowprops=dict(arrowstyle="->", color="#f87171", lw=2),
                 )
 
-        # Concatenation
         for i in range(steps):
             ax.plot(
                 [x_pos[i], x_pos[i]],
@@ -600,14 +642,13 @@ elif page == "📐 Architecture Study":
         | Task Type | Recommended Architecture | Why? |
         |---|---|---|
         | **Time Series Forecasting** | Standard LSTM / GRU | Future data is unknown; backward pass is impossible. |
-        | **Sequence Classification** | **BiLSTM** | The entire window is available; context from both ends improves accuracy (e.g., trend detection). |
+        | **Sequence Classification** | **BiLSTM** | The entire window is available; context from both ends improves accuracy. |
         | **Time Series Smoothing / Imputation** | **BiLSTM** | Missing values can be inferred from both past and future surrounding data. |
-        | **Natural Language Processing** | **BiLSTM** | Word meaning depends on both preceding and succeeding words (e.g., Named Entity Recognition). |
-        | **Anomaly Detection** | **BiLSTM** | Anomalies are often best identified by comparing a point to its full local context. |
+        | **Natural Language Processing** | **BiLSTM** | Word meaning depends on both preceding and succeeding words. |
         """)
 
 st.markdown("---")
 st.markdown(
-    "<center style='color:#4a5568;font-size:.78rem'>Bidirectional LSTM (BiLSTM) Explorer &nbsp;|&nbsp; TensorFlow · Keras · Scikit-learn</center>",
+    "<center style='color:#4a5568;font-size:.78rem'>Bidirectional LSTM (BiLSTM) Explorer &nbsp;|&nbsp; PyTorch · Scikit-learn</center>",
     unsafe_allow_html=True,
 )
