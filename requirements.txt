@@ -1,9 +1,7 @@
 streamlit
-numpy
+numpy<2
 pandas
 matplotlib
 seaborn
 scikit-learn
-tensorflow
-joblib
-wordcloud
+tensorflow==2.19.0
