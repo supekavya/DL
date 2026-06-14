@@ -353,17 +353,24 @@ elif page == "🔮 Predict":
             last_actual_inv = scaler.inverse_transform(scaled_values[-seq_len:])
 
             fig, ax = dfig(14, 5)
-            hist_steps = 100
+            hist_steps = len(last_actual_inv)
+
+# Plot historical data
             ax.plot(
                 np.arange(hist_steps),
-                last_actual_inv[-hist_steps:],
+                last_actual_inv.flatten(),
                 color="#818cf8",
                 lw=2,
                 label="Historical",
             )
+
+            # Plot forecast data (connects smoothly from the last historical point)
+            forecast_y = np.concatenate(([last_actual_inv[-1, 0]], forecast_inv.flatten()))
+            forecast_x = np.arange(hist_steps - 1, hist_steps - 1 + forecast_steps + 1)
+
             ax.plot(
-                np.arange(hist_steps - 1, hist_steps - 1 + forecast_steps),
-                np.vstack((last_actual_inv[-1], forecast_inv)),
+                forecast_x,
+                forecast_y,
                 color="#f87171",
                 lw=2,
                 linestyle="--",
